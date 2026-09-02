@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 #[derive(Debug)]
-#[allow(dead_code)] // wired by Task 2/3 (attribution & report)
+#[allow(dead_code)] // wired by Task 5 (CLI)
 pub enum ToolEventKind {
     /// Un tool_result apparié à son tool_use.
     Result {
@@ -23,14 +23,13 @@ pub enum ToolEventKind {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // wired by Task 2/3 (attribution & report)
+#[allow(dead_code)] // wired by Task 5 (CLI)
 pub struct ToolEvent {
     pub kind: ToolEventKind,
     pub seq: usize,
 }
 
 /// Minuscules + séparateurs unifiés : les transcripts Windows mélangent les deux.
-#[allow(dead_code)] // wired by Task 2/3 (attribution & report)
 pub fn normalize_path(p: &str) -> String {
     p.replace('\\', "/").to_lowercase()
 }
@@ -142,6 +141,182 @@ pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
         }
     }
     Ok((events, unmatched))
+}
+
+/// Extensions dont le contenu lu est binaire/extrait : incompressible par un filtre.
+#[allow(dead_code)] // wired by Task 5 (CLI)
+const BINARY_EXTS: &[&str] = &[
+    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".xls", ".xlsx", ".doc", ".docx",
+    ".ppt", ".pptx", ".zip",
+];
+
+#[allow(dead_code)] // wired by Task 5 (CLI)
+fn is_binary_path(p: &str) -> bool {
+    BINARY_EXTS.iter().any(|e| p.ends_with(e))
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ReadBreakdown {
+    pub total_calls: usize,
+    pub total_bytes: usize,
+    pub binary_bytes: usize,
+    pub pure_reread_calls: usize,
+    pub pure_reread_bytes: usize,
+    pub postedit_reread_calls: usize,
+    pub postedit_reread_bytes: usize,
+    pub locked_bytes: usize,
+    pub cross_session_first_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+#[allow(dead_code)] // wired by Task 3 (report)
+struct OffenderStat {
+    bytes: usize,
+    calls: usize,
+    max_calls_one_session: usize,
+    edited: bool,
+    binary: bool,
+}
+
+#[allow(dead_code)] // wired by Task 3/5 (report & CLI)
+pub struct AllToolsAnalyzer {
+    families: HashMap<String, (usize, usize)>, // family -> (calls, bytes)
+    read: ReadBreakdown,
+    offenders: HashMap<String, OffenderStat>,
+    /// Combien de sessions ANTÉRIEURES ont lu ce chemin.
+    seen_paths: HashMap<String, usize>,
+    unmatched_results: usize,
+    rtk_re: regex::Regex,
+}
+
+impl Default for AllToolsAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code)] // wired by Task 3/5 (report & CLI)
+impl AllToolsAnalyzer {
+    pub fn new() -> Self {
+        Self {
+            families: HashMap::new(),
+            read: ReadBreakdown::default(),
+            offenders: HashMap::new(),
+            seen_paths: HashMap::new(),
+            unmatched_results: 0,
+            rtk_re: regex::Regex::new(r"(^|[\s;|&(])rtk\s").expect("static regex"),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn read_breakdown(&self) -> &ReadBreakdown {
+        &self.read
+    }
+
+    fn family_key(&self, tool: &str, command: Option<&str>) -> String {
+        if tool == "Bash" {
+            let rtk = command.map(|c| self.rtk_re.is_match(c)).unwrap_or(false);
+            return if rtk {
+                "Bash (rtk)".into()
+            } else {
+                "Bash (raw)".into()
+            };
+        }
+        if let Some(rest) = tool.strip_prefix("mcp__") {
+            let server = rest.split("__").next().unwrap_or(rest);
+            return format!("MCP:{}", server);
+        }
+        if tool == "Task" || tool == "Agent" {
+            return "Task/Agent".into();
+        }
+        tool.to_string()
+    }
+
+    pub fn ingest_session(&mut self, events: &[ToolEvent], unmatched: usize) {
+        self.unmatched_results += unmatched;
+        // Passe 1 : positions des éditions par chemin.
+        let mut edit_seqs: HashMap<&str, Vec<usize>> = HashMap::new();
+        for e in events {
+            if let ToolEventKind::FileEdit { file_path } = &e.kind {
+                edit_seqs.entry(file_path.as_str()).or_default().push(e.seq);
+            }
+        }
+        // Passe 2 : résultats.
+        let mut last_read_seq: HashMap<&str, usize> = HashMap::new();
+        let mut session_reads: HashMap<&str, usize> = HashMap::new();
+        for e in events {
+            let ToolEventKind::Result {
+                tool,
+                bytes,
+                command,
+                file_path,
+            } = &e.kind
+            else {
+                continue;
+            };
+            let fam = self.family_key(tool, command.as_deref());
+            let entry = self.families.entry(fam).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += bytes;
+
+            let offender_key: Option<String> = if tool == "Read" {
+                file_path.clone()
+            } else if tool.starts_with("mcp__") {
+                Some(self.family_key(tool, None))
+            } else {
+                None
+            };
+            if let Some(key) = &offender_key {
+                let o = self.offenders.entry(key.clone()).or_default();
+                o.bytes += bytes;
+                o.calls += 1;
+            }
+
+            if tool != "Read" {
+                continue;
+            }
+            let Some(p) = file_path.as_deref() else {
+                continue;
+            };
+            self.read.total_calls += 1;
+            self.read.total_bytes += bytes;
+            let binary = is_binary_path(p);
+            if binary {
+                self.read.binary_bytes += bytes;
+            }
+            let edits = edit_seqs.get(p).map(Vec::as_slice).unwrap_or(&[]);
+            let locked = edits.iter().any(|&s| s > e.seq);
+            if locked {
+                self.read.locked_bytes += bytes;
+            }
+            if let Some(&prev) = last_read_seq.get(p) {
+                let inter_edit = edits.iter().any(|&s| s > prev && s < e.seq);
+                if inter_edit {
+                    self.read.postedit_reread_calls += 1;
+                    self.read.postedit_reread_bytes += bytes;
+                } else {
+                    self.read.pure_reread_calls += 1;
+                    self.read.pure_reread_bytes += bytes;
+                }
+            } else if self.seen_paths.get(p).copied().unwrap_or(0) > 0 {
+                self.read.cross_session_first_bytes += bytes;
+            }
+            if let Some(key) = &offender_key {
+                let o = self.offenders.entry(key.clone()).or_default();
+                o.edited |= !edits.is_empty();
+                o.binary |= binary;
+            }
+            *session_reads.entry(p).or_insert(0) += 1;
+            last_read_seq.insert(p, e.seq);
+        }
+        // Clôture session : cross-session + max par session.
+        for (p, n) in session_reads {
+            *self.seen_paths.entry(p.to_string()).or_insert(0) += 1;
+            if let Some(o) = self.offenders.get_mut(p) {
+                o.max_calls_one_session = o.max_calls_one_session.max(n);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -260,5 +435,96 @@ mod tests {
     #[test]
     fn test_normalize_path() {
         assert_eq!(normalize_path("C:\\Users\\X\\F.RS"), "c:/users/x/f.rs");
+    }
+
+    fn read_ev(seq: usize, path: &str, bytes: usize) -> ToolEvent {
+        ToolEvent {
+            kind: ToolEventKind::Result {
+                tool: "Read".into(),
+                bytes,
+                command: None,
+                file_path: Some(normalize_path(path)),
+            },
+            seq,
+        }
+    }
+    fn edit_ev(seq: usize, path: &str) -> ToolEvent {
+        ToolEvent {
+            kind: ToolEventKind::FileEdit {
+                file_path: normalize_path(path),
+            },
+            seq,
+        }
+    }
+
+    #[test]
+    fn test_pure_reread_same_session() {
+        let mut a = AllToolsAnalyzer::new();
+        a.ingest_session(&[read_ev(0, "a.rs", 100), read_ev(1, "a.rs", 100)], 0);
+        let r = a.read_breakdown();
+        assert_eq!(r.pure_reread_calls, 1);
+        assert_eq!(r.pure_reread_bytes, 100); // JAMAIS la 1re lecture
+        assert_eq!(r.total_bytes, 200);
+    }
+
+    #[test]
+    fn test_reread_after_edit_is_postedit_not_pure() {
+        let mut a = AllToolsAnalyzer::new();
+        a.ingest_session(
+            &[
+                read_ev(0, "a.rs", 100),
+                edit_ev(1, "a.rs"),
+                read_ev(2, "a.rs", 80),
+            ],
+            0,
+        );
+        let r = a.read_breakdown();
+        assert_eq!(r.pure_reread_calls, 0);
+        assert_eq!(r.postedit_reread_calls, 1);
+        assert_eq!(r.postedit_reread_bytes, 80);
+        assert_eq!(r.locked_bytes, 100); // la 1re lecture précède une édition
+    }
+
+    #[test]
+    fn test_edit_then_first_read_is_not_a_reread() {
+        let mut a = AllToolsAnalyzer::new();
+        a.ingest_session(&[edit_ev(0, "a.rs"), read_ev(1, "a.rs", 50)], 0);
+        let r = a.read_breakdown();
+        assert_eq!(r.pure_reread_calls + r.postedit_reread_calls, 0);
+    }
+
+    #[test]
+    fn test_cross_session_first_read_not_counted_as_waste() {
+        // Anti-régression méthodologique (l'erreur 26% -> 6,5% de la spec §5) :
+        // le même fichier lu dans 2 sessions = cross-session, PAS relecture.
+        let mut a = AllToolsAnalyzer::new();
+        a.ingest_session(&[read_ev(0, "a.rs", 100)], 0);
+        a.ingest_session(&[read_ev(0, "a.rs", 100)], 0);
+        let r = a.read_breakdown();
+        assert_eq!(r.pure_reread_calls, 0);
+        assert_eq!(r.cross_session_first_bytes, 100);
+    }
+
+    #[test]
+    fn test_binary_extension_detected_case_insensitive() {
+        let mut a = AllToolsAnalyzer::new();
+        a.ingest_session(&[read_ev(0, "C:\\Docs\\Contrat.PDF", 500)], 0);
+        assert_eq!(a.read_breakdown().binary_bytes, 500);
+    }
+
+    #[test]
+    fn test_edit_on_other_path_does_not_interfere() {
+        let mut a = AllToolsAnalyzer::new();
+        a.ingest_session(
+            &[
+                read_ev(0, "a.rs", 10),
+                edit_ev(1, "b.rs"),
+                read_ev(2, "a.rs", 10),
+            ],
+            0,
+        );
+        let r = a.read_breakdown();
+        assert_eq!(r.pure_reread_calls, 1);
+        assert_eq!(r.locked_bytes, 0);
     }
 }

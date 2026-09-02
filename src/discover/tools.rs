@@ -393,6 +393,115 @@ pub struct AllToolsReport {
     pub total_bytes: usize,
 }
 
+fn fmt_bytes(b: usize) -> String {
+    if b >= 1_048_576 {
+        format!("{:.1} MB", b as f64 / 1_048_576.0)
+    } else if b >= 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else {
+        format!("{} B", b)
+    }
+}
+
+fn pct(part: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / total as f64
+    }
+}
+
+/// Rendu texte du rapport `--all-tools` (attribution complète, tous outils).
+pub fn format_all_tools_text(r: &AllToolsReport) -> String {
+    let mut out = String::with_capacity(2048);
+    out.push_str("ALL TOOLS -- Token Attribution (tool_result bytes, ~4 bytes/token)\n");
+    out.push_str(&"=".repeat(68));
+    out.push('\n');
+    out.push_str(&format!(
+        "{:<28}{:>8}{:>12}{:>8}\n",
+        "FAMILY", "CALLS", "BYTES", "SHARE"
+    ));
+    for f in &r.families {
+        out.push_str(&format!(
+            "{:<28}{:>8}{:>12}{:>7.1}%\n",
+            f.family,
+            f.calls,
+            fmt_bytes(f.bytes),
+            pct(f.bytes, r.total_bytes)
+        ));
+    }
+    let rd = &r.read;
+    out.push_str("\nREAD BREAKDOWN (percentages of Read bytes; classes overlap)\n");
+    out.push_str(&format!(
+        "  binary (pdf/img/office)        {:>6.1}%  incompressible\n",
+        pct(rd.binary_bytes, rd.total_bytes)
+    ));
+    out.push_str(&format!(
+        "  re-read same session, no edit  {:>6.1}%  deduplicable ({} calls)\n",
+        pct(rd.pure_reread_bytes, rd.total_bytes),
+        rd.pure_reread_calls
+    ));
+    out.push_str(&format!(
+        "  re-read after edit (verify)    {:>6.1}%  ({} calls)\n",
+        pct(rd.postedit_reread_bytes, rd.total_bytes),
+        rd.postedit_reread_calls
+    ));
+    out.push_str(&format!(
+        "  read then edited (locked)      {:>6.1}%  never filterable\n",
+        pct(rd.locked_bytes, rd.total_bytes)
+    ));
+    out.push_str(&format!(
+        "  first read in later session    {:>6.1}%  legitimate\n",
+        pct(rd.cross_session_first_bytes, rd.total_bytes)
+    ));
+    out.push_str("\nTOP OFFENDERS\n");
+    for o in &r.offenders {
+        let mut tags = String::new();
+        if o.edited {
+            tags.push_str("[EDITED]");
+        }
+        if o.binary {
+            tags.push_str("[BINARY]");
+        }
+        if o.calls > 1 {
+            tags.push_str(&format!(
+                "[x{} max {}/session]",
+                o.calls, o.max_calls_one_session
+            ));
+        }
+        out.push_str(&format!(
+            "  {:>10}  {} {}\n",
+            fmt_bytes(o.bytes),
+            o.key,
+            tags
+        ));
+    }
+    let rtk_bytes = r
+        .families
+        .iter()
+        .filter(|f| f.family == "Bash (rtk)")
+        .map(|f| f.bytes)
+        .sum::<usize>();
+    out.push_str(&format!(
+        "\nVERDICT: {:.0}% incompressible (binary) | {:.1}% deduplicable (re-reads) | \
+         {:.0}% locked by edits | {:.0}% already through rtk\n",
+        pct(rd.binary_bytes, r.total_bytes),
+        pct(
+            rd.pure_reread_bytes + rd.postedit_reread_bytes,
+            r.total_bytes
+        ),
+        pct(rd.locked_bytes, r.total_bytes),
+        pct(rtk_bytes, r.total_bytes)
+    ));
+    if r.unmatched_results > 0 {
+        out.push_str(&format!(
+            "({} unmatched tool results ignored)\n",
+            r.unmatched_results
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +774,34 @@ mod tests {
         };
         assert_eq!(get("Bash (rtk)"), Some(2));
         assert_eq!(get("Bash (raw)"), Some(1));
+    }
+
+    #[test]
+    fn test_format_text_sections_and_verdict() {
+        let mut a = AllToolsAnalyzer::new();
+        a.ingest_session(
+            &[
+                read_ev(0, "big.pdf", 640),
+                read_ev(1, "a.rs", 100),
+                read_ev(2, "a.rs", 60),
+            ],
+            0,
+        );
+        let out = format_all_tools_text(&a.finish(10));
+        assert!(out.contains("ALL TOOLS"));
+        assert!(out.contains("Read"));
+        assert!(out.contains("binary")); // décomposition Read
+        assert!(out.contains("re-read"));
+        assert!(out.contains("VERDICT:"));
+        assert!(out.contains("deduplicable")); // vocabulaire du verdict
+        assert!(out.contains("[BINARY]")); // étiquette offender
+        assert!(!out.contains("saveable")); // pas de promesse de gain chiffrée
+    }
+
+    #[test]
+    fn test_format_text_empty_report_no_panic() {
+        let out = format_all_tools_text(&AllToolsAnalyzer::new().finish(10));
+        assert!(out.contains("ALL TOOLS")); // pas de division par zéro
     }
 
     #[test]

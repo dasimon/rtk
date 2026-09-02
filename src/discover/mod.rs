@@ -265,6 +265,7 @@ pub fn run(
         rtk_disabled_count,
         rtk_disabled_examples,
         agent_status: report::AgentIntegrationStatus::detect(),
+        all_tools: None,
     };
 
     match format {

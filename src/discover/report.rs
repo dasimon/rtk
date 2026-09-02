@@ -105,6 +105,9 @@ pub struct DiscoverReport {
     pub rtk_disabled_count: usize,
     pub rtk_disabled_examples: Vec<String>,
     pub agent_status: AgentIntegrationStatus,
+    /// Attribution tous-outils (`--all-tools` uniquement). Absent du JSON sinon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all_tools: Option<crate::discover::tools::AllToolsReport>,
 }
 
 impl DiscoverReport {
@@ -224,6 +227,11 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
         out.push_str(&format!("Parse errors skipped: {}\n", report.parse_errors));
     }
 
+    if let Some(at) = &report.all_tools {
+        out.push('\n');
+        out.push_str(&crate::discover::tools::format_all_tools_text(at));
+    }
+
     out
 }
 
@@ -286,7 +294,14 @@ mod tests {
             rtk_disabled_count: 0,
             rtk_disabled_examples: vec![],
             agent_status: AgentIntegrationStatus::default(),
+            all_tools: None,
         }
+    }
+
+    #[test]
+    fn test_format_json_omits_all_tools_when_none() {
+        let report = make_report(10, 2);
+        assert!(!format_json(&report).contains("all_tools"));
     }
 
     // B6 regression: integer division truncated small percentages to 0%.

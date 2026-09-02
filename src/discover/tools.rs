@@ -2,7 +2,7 @@
 //! from Claude Code session JSONL (the Bash-only provider misses ~65% of bytes).
 
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -46,10 +46,11 @@ pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
 
     // id -> (tool name, command Bash éventuelle, file_path Read éventuel)
     let mut pending: HashMap<String, (String, Option<String>, Option<String>)> = HashMap::new();
-    // ids des tool_use Edit/Write/NotebookEdit : leur tool_result est attendu
-    // (déjà compté via l'événement FileEdit) et doit être consommé sans
-    // incrémenter unmatched.
-    let mut edit_ids: HashSet<String> = HashSet::new();
+    // ids des tool_use Edit/Write/NotebookEdit -> nom de l'outil : leur tool_result
+    // est attendu et doit désormais être émis comme événement Result (bytes du
+    // résultat), en plus du FileEdit déjà émis au tool_use (spec §4.1 : Edit/Write/
+    // NotebookEdit doivent apparaître comme familles dans le tableau ALL TOOLS).
+    let mut edit_ids: HashMap<String, String> = HashMap::new();
     let mut events = Vec::new();
     let mut unmatched = 0usize;
     let mut seq = 0usize;
@@ -83,7 +84,7 @@ pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
                         .map(normalize_path);
                     if EDIT_TOOLS.contains(&name) {
                         if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
-                            edit_ids.insert(id.to_string());
+                            edit_ids.insert(id.to_string(), name.to_string());
                         }
                         if let Some(p) = input_path {
                             events.push(ToolEvent {
@@ -107,20 +108,28 @@ pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
                     let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
                         continue;
                     };
-                    if edit_ids.remove(id) {
-                        // Résultat d'un Edit/Write/NotebookEdit : déjà compté au
-                        // tool_use, consommé sans incrémenter unmatched.
+                    if let Some(tool) = edit_ids.remove(id) {
+                        // Résultat d'un Edit/Write/NotebookEdit : le FileEdit a déjà
+                        // été émis au tool_use, mais les octets du résultat sont
+                        // encore comptés ici (spec §4.1) so the family shows up in
+                        // the ALL TOOLS table and total_bytes is not understated.
+                        events.push(ToolEvent {
+                            kind: ToolEventKind::Result {
+                                tool,
+                                bytes: result_bytes(block),
+                                command: None,
+                                file_path: None,
+                            },
+                            seq,
+                        });
+                        seq += 1;
                         continue;
                     }
                     let Some((tool, command, file_path)) = pending.remove(id) else {
                         unmatched += 1;
                         continue;
                     };
-                    let bytes = match block.get("content") {
-                        Some(serde_json::Value::String(s)) => s.len(),
-                        Some(other) => serde_json::to_string(other).map(|s| s.len()).unwrap_or(0),
-                        None => 0,
-                    };
+                    let bytes = result_bytes(block);
                     events.push(ToolEvent {
                         kind: ToolEventKind::Result {
                             tool,
@@ -137,6 +146,16 @@ pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
         }
     }
     Ok((events, unmatched))
+}
+
+/// Taille d'un tool_result : longueur de `content` si chaîne, sinon longueur du
+/// JSON sérialisé (spec §5).
+fn result_bytes(block: &serde_json::Value) -> usize {
+    match block.get("content") {
+        Some(serde_json::Value::String(s)) => s.len(),
+        Some(other) => serde_json::to_string(other).map(|s| s.len()).unwrap_or(0),
+        None => 0,
+    }
 }
 
 /// Extensions dont le contenu lu est binaire/extrait : incompressible par un filtre.
@@ -179,7 +198,6 @@ pub struct AllToolsAnalyzer {
     /// Combien de sessions ANTÉRIEURES ont lu ce chemin.
     seen_paths: HashMap<String, usize>,
     unmatched_results: usize,
-    rtk_re: regex::Regex,
 }
 
 impl Default for AllToolsAnalyzer {
@@ -196,7 +214,6 @@ impl AllToolsAnalyzer {
             offenders: HashMap::new(),
             seen_paths: HashMap::new(),
             unmatched_results: 0,
-            rtk_re: regex::Regex::new(r"(^|[\s;|&(])rtk\s").expect("static regex"),
         }
     }
 
@@ -208,7 +225,17 @@ impl AllToolsAnalyzer {
 
     fn family_key(&self, tool: &str, command: Option<&str>) -> String {
         if tool == "Bash" {
-            let rtk = command.map(|c| self.rtk_re.is_match(c)).unwrap_or(false);
+            // Reuse the same chain-splitter mod.rs's Bash pass already relies on
+            // (registry::split_command_chain) instead of a separate regex, so this
+            // classification can never contradict `already_rtk` on the same output
+            // and never false-positives on "rtk" inside a quoted string.
+            let rtk = command
+                .map(|c| {
+                    crate::discover::registry::split_command_chain(c)
+                        .iter()
+                        .any(|p| p.trim_start().starts_with("rtk ") || p.trim() == "rtk")
+                })
+                .unwrap_or(false);
             return if rtk {
                 "Bash (rtk)".into()
             } else {
@@ -236,7 +263,11 @@ impl AllToolsAnalyzer {
         }
         // Passe 2 : résultats.
         let mut last_read_seq: HashMap<&str, usize> = HashMap::new();
+        // Read paths only : nourrit seen_paths (cross-session).
         let mut session_reads: HashMap<&str, usize> = HashMap::new();
+        // TOUTES les clés offender (Read paths + MCP:<server>) : nourrit
+        // max_calls_one_session pour chaque offender, pas seulement Read.
+        let mut session_offender_calls: HashMap<String, usize> = HashMap::new();
         for e in events {
             let ToolEventKind::Result {
                 tool,
@@ -263,6 +294,7 @@ impl AllToolsAnalyzer {
                 let o = self.offenders.entry(key.clone()).or_default();
                 o.bytes += bytes;
                 o.calls += 1;
+                *session_offender_calls.entry(key.clone()).or_insert(0) += 1;
             }
 
             if tool != "Read" {
@@ -302,10 +334,13 @@ impl AllToolsAnalyzer {
             *session_reads.entry(p).or_insert(0) += 1;
             last_read_seq.insert(p, e.seq);
         }
-        // Clôture session : cross-session + max par session.
-        for (p, n) in session_reads {
+        // Clôture session : cross-session (Read paths uniquement).
+        for p in session_reads.keys() {
             *self.seen_paths.entry(p.to_string()).or_insert(0) += 1;
-            if let Some(o) = self.offenders.get_mut(p) {
+        }
+        // Clôture session : max par session, pour TOUS les offenders (Read + MCP).
+        for (key, n) in session_offender_calls {
+            if let Some(o) = self.offenders.get_mut(&key) {
                 o.max_calls_one_session = o.max_calls_one_session.max(n);
             }
         }
@@ -445,15 +480,15 @@ pub fn format_all_tools_text(r: &AllToolsReport) -> String {
     ));
     out.push_str("\nTOP OFFENDERS\n");
     for o in &r.offenders {
-        let mut tags = String::new();
+        let mut tags: Vec<String> = Vec::new();
         if o.edited {
-            tags.push_str("[EDITED]");
+            tags.push("[EDITED]".to_string());
         }
         if o.binary {
-            tags.push_str("[BINARY]");
+            tags.push("[BINARY]".to_string());
         }
         if o.calls > 1 {
-            tags.push_str(&format!(
+            tags.push(format!(
                 "[x{} max {}/session]",
                 o.calls, o.max_calls_one_session
             ));
@@ -462,7 +497,7 @@ pub fn format_all_tools_text(r: &AllToolsReport) -> String {
             "  {:>10}  {} {}\n",
             fmt_bytes(o.bytes),
             o.key,
-            tags
+            tags.join(" ")
         ));
     }
     let rtk_bytes = r
@@ -472,13 +507,10 @@ pub fn format_all_tools_text(r: &AllToolsReport) -> String {
         .map(|f| f.bytes)
         .sum::<usize>();
     out.push_str(&format!(
-        "\nVERDICT: {:.0}% incompressible (binary) | {:.1}% deduplicable (re-reads) | \
+        "\nVERDICT: {:.0}% incompressible (binary) | {:.1}% deduplicable (pure re-reads) | \
          {:.0}% locked by edits | {:.0}% already through rtk\n",
         pct(rd.binary_bytes, r.total_bytes),
-        pct(
-            rd.pure_reread_bytes + rd.postedit_reread_bytes,
-            r.total_bytes
-        ),
+        pct(rd.pure_reread_bytes, r.total_bytes),
         pct(rd.locked_bytes, r.total_bytes),
         pct(rtk_bytes, r.total_bytes)
     ));
@@ -574,16 +606,52 @@ mod tests {
 
     #[test]
     fn test_extract_edit_result_consumed_not_unmatched() {
+        // Finding A: an Edit's tool_result is still emitted as a Result event
+        // (its bytes must count toward total_bytes / the ALL TOOLS table), in
+        // addition to the FileEdit already emitted at tool_use.
         let edit_l = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"C:\\Proj\\A.rs","old_string":"x","new_string":"y"}}]}}"#;
         let edit_res = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"e1","content":"ignored"}]}}"#;
         let f = make_jsonl(&[edit_l, edit_res]);
         let (events, unmatched) = extract_tool_events(f.path()).unwrap();
         assert_eq!(unmatched, 0);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         match &events[0].kind {
             ToolEventKind::FileEdit { file_path } => assert_eq!(file_path, "c:/proj/a.rs"),
             _ => panic!("expected FileEdit"),
         }
+        match &events[1].kind {
+            ToolEventKind::Result {
+                tool,
+                bytes,
+                command,
+                file_path,
+            } => {
+                assert_eq!(tool, "Edit");
+                assert_eq!(*bytes, "ignored".len());
+                assert!(command.is_none());
+                assert!(file_path.is_none());
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn test_finish_edit_family_carries_result_bytes() {
+        // Finding A, finish()-level: the "Edit" family appears with the result's
+        // bytes (denominator of SHARE/VERDICT percentages must not be understated).
+        let edit_l = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"C:\\Proj\\A.rs","old_string":"x","new_string":"y"}}]}}"#;
+        let edit_res = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"e1","content":"ignored"}]}}"#;
+        let f = make_jsonl(&[edit_l, edit_res]);
+        let (events, unmatched) = extract_tool_events(f.path()).unwrap();
+        let mut a = AllToolsAnalyzer::new();
+        a.ingest_session(&events, unmatched);
+        let r = a.finish(10);
+        let edit_family = r.families.iter().find(|f| f.family == "Edit");
+        assert!(edit_family.is_some(), "expected an Edit family entry");
+        let edit_family = edit_family.unwrap();
+        assert_eq!(edit_family.calls, 1);
+        assert_eq!(edit_family.bytes, "ignored".len());
+        assert_eq!(r.total_bytes, "ignored".len());
     }
 
     #[test]
@@ -763,6 +831,79 @@ mod tests {
         };
         assert_eq!(get("Bash (rtk)"), Some(2));
         assert_eq!(get("Bash (raw)"), Some(1));
+    }
+
+    #[test]
+    fn test_finish_bash_rtk_quoted_string_false_positive_rejected() {
+        // Finding C: "rtk" appearing inside a quoted string argument must NOT be
+        // classified as "Bash (rtk)" -- split_command_chain only splits on
+        // unquoted operators, it doesn't scan inside string literals.
+        let mut a = AllToolsAnalyzer::new();
+        let ev = ToolEvent {
+            kind: ToolEventKind::Result {
+                tool: "Bash".into(),
+                bytes: 1,
+                command: Some(r#"git commit -m "use rtk always""#.into()),
+                file_path: None,
+            },
+            seq: 0,
+        };
+        a.ingest_session(&[ev], 0);
+        let r = a.finish(10);
+        let get = |name: &str| {
+            r.families
+                .iter()
+                .find(|f| f.family == name)
+                .map(|f| f.calls)
+        };
+        assert_eq!(get("Bash (raw)"), Some(1));
+        assert_eq!(get("Bash (rtk)"), None);
+    }
+
+    #[test]
+    fn test_finish_max_calls_one_session_tracked_for_mcp_offenders() {
+        // Finding B: session_reads previously only fed Read offenders (the
+        // `if tool != "Read" { continue; }` guard skipped MCP entirely), so
+        // MCP offenders always showed "max 0/session". Two MCP calls in the
+        // SAME session must now yield max_calls_one_session == 2.
+        let mut a = AllToolsAnalyzer::new();
+        let mk = |seq: usize| ToolEvent {
+            kind: ToolEventKind::Result {
+                tool: "mcp__ms365__chat_message_search".into(),
+                bytes: 10,
+                command: None,
+                file_path: None,
+            },
+            seq,
+        };
+        a.ingest_session(&[mk(0), mk(1)], 0);
+        let r = a.finish(10);
+        let offender = r
+            .offenders
+            .iter()
+            .find(|o| o.key == "MCP:ms365")
+            .expect("expected MCP:ms365 offender");
+        assert_eq!(offender.calls, 2);
+        assert_eq!(offender.max_calls_one_session, 2);
+    }
+
+    #[test]
+    fn test_pure_reread_across_mixed_path_separators() {
+        // Finding H(b): the same file read once with backslashes and once with
+        // forward slashes in the same session must classify as a re-read --
+        // pins normalize_path's role end-to-end (extraction, not just the
+        // standalone normalize_path unit test).
+        let mut a = AllToolsAnalyzer::new();
+        a.ingest_session(
+            &[
+                read_ev(0, "C:\\proj\\a.rs", 100),
+                read_ev(1, "c:/proj/a.rs", 100),
+            ],
+            0,
+        );
+        let r = a.read_breakdown();
+        assert_eq!(r.pure_reread_calls, 1);
+        assert_eq!(r.pure_reread_bytes, 100);
     }
 
     #[test]

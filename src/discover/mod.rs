@@ -257,7 +257,20 @@ pub fn run(
 
     let all_tools_report = if all_tools {
         let mut analyzer = tools::AllToolsAnalyzer::new();
-        for session_path in &sessions {
+        // Finding D: cross_session_first_bytes classifies "first read in THIS
+        // session, path already read in an EARLIER session" (spec §5) -- that
+        // requires chronological order, but `sessions` is filesystem enumeration
+        // order (unsorted). Sort a copy by mtime ascending for this pass only;
+        // this does not affect the pre-existing Bash pass above, which keeps
+        // iterating `sessions` in its original order.
+        let mut ordered_sessions = sessions.clone();
+        ordered_sessions.sort_by_key(|p| {
+            let mtime = std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (mtime, p.clone())
+        });
+        for session_path in &ordered_sessions {
             match tools::extract_tool_events(session_path) {
                 Ok((events, unmatched)) => analyzer.ingest_session(&events, unmatched),
                 Err(e) => {

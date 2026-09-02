@@ -313,6 +313,15 @@ mod tests {
         assert!(!format_json(&report).contains("all_tools"));
     }
 
+    // Finding H(a): the positive counterpart of the omission test above --
+    // when `all_tools` is Some, the JSON output must contain the field.
+    #[test]
+    fn test_format_json_includes_all_tools_when_some() {
+        let mut report = make_report(10, 2);
+        report.all_tools = Some(crate::discover::tools::AllToolsAnalyzer::new().finish(10));
+        assert!(format_json(&report).contains("all_tools"));
+    }
+
     // Controller-mandated regression: format_text's early return (no missed
     // Bash savings) must still render the ALL TOOLS section when --all-tools
     // was requested, even for a session with zero Bash commands.

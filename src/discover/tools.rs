@@ -151,6 +151,7 @@ const BINARY_EXTS: &[&str] = &[
 ];
 
 #[allow(dead_code)] // wired by Task 5 (CLI)
+/// Attend un chemin déjà normalisé par `normalize_path` (minuscules, `/`).
 fn is_binary_path(p: &str) -> bool {
     BINARY_EXTS.iter().any(|e| p.ends_with(e))
 }
@@ -317,6 +318,79 @@ impl AllToolsAnalyzer {
             }
         }
     }
+
+    /// Consomme l'analyzer et produit le rapport agrégé : familles triées par
+    /// octets décroissants, top `limit` offenders (idem), totaux.
+    pub fn finish(self, limit: usize) -> AllToolsReport {
+        let mut families: Vec<FamilyStat> = self
+            .families
+            .into_iter()
+            .map(|(family, (calls, bytes))| FamilyStat {
+                family,
+                calls,
+                bytes,
+            })
+            .collect();
+        families.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.family.cmp(&b.family)));
+        let total_bytes = families.iter().map(|f| f.bytes).sum();
+        let mut offenders: Vec<OffenderEntry> = self
+            .offenders
+            .into_iter()
+            .map(|(key, o)| OffenderEntry {
+                key,
+                bytes: o.bytes,
+                calls: o.calls,
+                max_calls_one_session: o.max_calls_one_session,
+                edited: o.edited,
+                binary: o.binary,
+            })
+            .collect();
+        offenders.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.key.cmp(&b.key)));
+        offenders.truncate(limit);
+        AllToolsReport {
+            families,
+            read: self.read,
+            offenders,
+            unmatched_results: self.unmatched_results,
+            total_bytes,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[allow(dead_code)] // wired by Task 4/5 (rendu & CLI)
+pub struct FamilyStat {
+    pub family: String,
+    pub calls: usize,
+    pub bytes: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[allow(dead_code)] // wired by Task 4/5 (rendu & CLI)
+pub struct OffenderEntry {
+    pub key: String,
+    pub bytes: usize,
+    pub calls: usize,
+    pub max_calls_one_session: usize,
+    pub edited: bool,
+    pub binary: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[allow(dead_code)] // wired by Task 4/5 (rendu & CLI)
+pub struct AllToolsReport {
+    pub families: Vec<FamilyStat>,
+    /// Détail des Read (voir `ReadBreakdown`).
+    /// ⚠️ Écart de réconciliation connu : un tool_result Read sans `file_path`
+    /// (ex. Read refusé/erreur avant résolution du chemin) est compté dans
+    /// `families["Read"]` (calls/bytes) mais PAS dans ce breakdown, qui exige
+    /// un chemin pour classer la lecture (reread, locked, binaire, etc.).
+    /// `read.total_bytes` peut donc être strictement inférieur aux octets de
+    /// la famille "Read".
+    pub read: ReadBreakdown,
+    pub offenders: Vec<OffenderEntry>,
+    pub unmatched_results: usize,
+    pub total_bytes: usize,
 }
 
 #[cfg(test)]
@@ -526,5 +600,104 @@ mod tests {
         let r = a.read_breakdown();
         assert_eq!(r.pure_reread_calls, 1);
         assert_eq!(r.locked_bytes, 0);
+    }
+
+    #[test]
+    fn test_finish_sorts_families_and_limits_offenders() {
+        let mut a = AllToolsAnalyzer::new();
+        let bash = ToolEvent {
+            kind: ToolEventKind::Result {
+                tool: "Bash".into(),
+                bytes: 10,
+                command: Some("git status".into()),
+                file_path: None,
+            },
+            seq: 0,
+        };
+        let mcp = ToolEvent {
+            kind: ToolEventKind::Result {
+                tool: "mcp__grafana__query_prometheus".into(),
+                bytes: 999,
+                command: None,
+                file_path: None,
+            },
+            seq: 1,
+        };
+        a.ingest_session(
+            &[bash, mcp, read_ev(2, "a.rs", 100), read_ev(3, "b.rs", 50)],
+            2,
+        );
+        let r = a.finish(1);
+        assert_eq!(r.total_bytes, 10 + 999 + 150);
+        assert_eq!(r.unmatched_results, 2);
+        assert_eq!(r.families[0].family, "MCP:grafana"); // plus gros d'abord
+        assert!(r.families.iter().any(|f| f.family == "Bash (raw)"));
+        assert_eq!(r.offenders.len(), 1); // limit=1
+        assert_eq!(r.offenders[0].key, "MCP:grafana"); // 999 > 100
+    }
+
+    #[test]
+    fn test_finish_bash_rtk_vs_raw_split() {
+        let mut a = AllToolsAnalyzer::new();
+        let mk = |seq: usize, cmd: &str| ToolEvent {
+            kind: ToolEventKind::Result {
+                tool: "Bash".into(),
+                bytes: 1,
+                command: Some(cmd.into()),
+                file_path: None,
+            },
+            seq,
+        };
+        a.ingest_session(
+            &[
+                mk(0, "rtk git status"),
+                mk(1, "cd x && rtk ls"),
+                mk(2, "git log"),
+            ],
+            0,
+        );
+        let r = a.finish(10);
+        let get = |name: &str| {
+            r.families
+                .iter()
+                .find(|f| f.family == name)
+                .map(|f| f.calls)
+        };
+        assert_eq!(get("Bash (rtk)"), Some(2));
+        assert_eq!(get("Bash (raw)"), Some(1));
+    }
+
+    #[test]
+    fn test_finish_task_and_grep_family_names() {
+        // Attribution mandatée par la revue Task 2 : Task/Agent regroupé, Grep inchangé.
+        let mut a = AllToolsAnalyzer::new();
+        let task_ev = ToolEvent {
+            kind: ToolEventKind::Result {
+                tool: "Task".into(),
+                bytes: 5,
+                command: None,
+                file_path: None,
+            },
+            seq: 0,
+        };
+        let grep_ev = ToolEvent {
+            kind: ToolEventKind::Result {
+                tool: "Grep".into(),
+                bytes: 3,
+                command: None,
+                file_path: None,
+            },
+            seq: 1,
+        };
+        a.ingest_session(&[task_ev, grep_ev], 0);
+        let r = a.finish(10);
+        let get = |name: &str| {
+            r.families
+                .iter()
+                .find(|f| f.family == name)
+                .map(|f| f.calls)
+        };
+        assert_eq!(get("Task/Agent"), Some(1));
+        assert_eq!(get("Grep"), Some(1));
     }
 }

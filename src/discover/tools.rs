@@ -7,7 +7,6 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 #[derive(Debug)]
-#[allow(dead_code)] // wired by Task 5 (CLI)
 pub enum ToolEventKind {
     /// Un tool_result apparié à son tool_use.
     Result {
@@ -23,7 +22,6 @@ pub enum ToolEventKind {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // wired by Task 5 (CLI)
 pub struct ToolEvent {
     pub kind: ToolEventKind,
     pub seq: usize,
@@ -34,7 +32,6 @@ pub fn normalize_path(p: &str) -> String {
     p.replace('\\', "/").to_lowercase()
 }
 
-#[allow(dead_code)] // wired by Task 2/3 (attribution & report)
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
 /// Extrait tous les événements outils d'une session, dans l'ordre du fichier.
@@ -42,7 +39,6 @@ const EDIT_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 /// dont le tool_use est un Edit/Write/NotebookEdit est consommé silencieusement,
 /// pas compté, puisque son événement a déjà été émis au tool_use). Ligne invalide
 /// = ignorée.
-#[allow(dead_code)] // wired by Task 2/3 (attribution & report)
 pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
     let file =
         std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -144,13 +140,11 @@ pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
 }
 
 /// Extensions dont le contenu lu est binaire/extrait : incompressible par un filtre.
-#[allow(dead_code)] // wired by Task 5 (CLI)
 const BINARY_EXTS: &[&str] = &[
     ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".xls", ".xlsx", ".doc", ".docx",
     ".ppt", ".pptx", ".zip",
 ];
 
-#[allow(dead_code)] // wired by Task 5 (CLI)
 /// Attend un chemin déjà normalisé par `normalize_path` (minuscules, `/`).
 fn is_binary_path(p: &str) -> bool {
     BINARY_EXTS.iter().any(|e| p.ends_with(e))
@@ -170,7 +164,6 @@ pub struct ReadBreakdown {
 }
 
 #[derive(Debug, Default)]
-#[allow(dead_code)] // wired by Task 3 (report)
 struct OffenderStat {
     bytes: usize,
     calls: usize,
@@ -179,7 +172,6 @@ struct OffenderStat {
     binary: bool,
 }
 
-#[allow(dead_code)] // wired by Task 3/5 (report & CLI)
 pub struct AllToolsAnalyzer {
     families: HashMap<String, (usize, usize)>, // family -> (calls, bytes)
     read: ReadBreakdown,
@@ -196,7 +188,6 @@ impl Default for AllToolsAnalyzer {
     }
 }
 
-#[allow(dead_code)] // wired by Task 3/5 (report & CLI)
 impl AllToolsAnalyzer {
     pub fn new() -> Self {
         Self {
@@ -210,6 +201,7 @@ impl AllToolsAnalyzer {
     }
 
     #[doc(hidden)]
+    #[allow(dead_code)] // exposed for tests only (read_breakdown); finish() reads self.read directly
     pub fn read_breakdown(&self) -> &ReadBreakdown {
         &self.read
     }
@@ -358,7 +350,6 @@ impl AllToolsAnalyzer {
 }
 
 #[derive(Debug, serde::Serialize)]
-#[allow(dead_code)] // wired by Task 4/5 (rendu & CLI)
 pub struct FamilyStat {
     pub family: String,
     pub calls: usize,
@@ -366,7 +357,6 @@ pub struct FamilyStat {
 }
 
 #[derive(Debug, serde::Serialize)]
-#[allow(dead_code)] // wired by Task 4/5 (rendu & CLI)
 pub struct OffenderEntry {
     pub key: String,
     pub bytes: usize,
@@ -377,7 +367,6 @@ pub struct OffenderEntry {
 }
 
 #[derive(Debug, serde::Serialize)]
-#[allow(dead_code)] // wired by Task 4/5 (rendu & CLI)
 pub struct AllToolsReport {
     pub families: Vec<FamilyStat>,
     /// Détail des Read (voir `ReadBreakdown`).

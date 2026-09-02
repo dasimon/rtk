@@ -48,6 +48,7 @@ pub fn run(
     limit: usize,
     format: &str,
     verbose: u8,
+    all_tools: bool,
 ) -> Result<()> {
     let provider = ClaudeProvider;
 
@@ -254,6 +255,27 @@ pub fn run(
             .collect()
     };
 
+    let all_tools_report = if all_tools {
+        let mut analyzer = tools::AllToolsAnalyzer::new();
+        for session_path in &sessions {
+            match tools::extract_tool_events(session_path) {
+                Ok((events, unmatched)) => analyzer.ingest_session(&events, unmatched),
+                Err(e) => {
+                    if verbose > 0 {
+                        eprintln!(
+                            "Warning (all-tools): skipping {}: {}",
+                            session_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        Some(analyzer.finish(limit))
+    } else {
+        None
+    };
+
     let report = DiscoverReport {
         sessions_scanned: sessions.len(),
         total_commands,
@@ -265,7 +287,7 @@ pub fn run(
         rtk_disabled_count,
         rtk_disabled_examples,
         agent_status: report::AgentIntegrationStatus::detect(),
-        all_tools: None,
+        all_tools: all_tools_report,
     };
 
     match format {

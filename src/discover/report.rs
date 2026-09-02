@@ -147,6 +147,7 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
     if report.supported.is_empty() && report.unsupported.is_empty() {
         out.push_str("\nNo missed savings found. RTK usage looks good!\n");
         append_agent_notes(&mut out, report.agent_status);
+        append_all_tools_section(&mut out, report);
         return out;
     }
 
@@ -227,12 +228,20 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
         out.push_str(&format!("Parse errors skipped: {}\n", report.parse_errors));
     }
 
+    append_all_tools_section(&mut out, report);
+
+    out
+}
+
+/// Appends the `--all-tools` section, if present, at the end of the text report.
+/// Shared by both `format_text` exit paths (the "no missed savings" early return
+/// and the normal end-of-function path) so the section always renders when
+/// `report.all_tools` is `Some`, regardless of whether Bash-command savings exist.
+fn append_all_tools_section(out: &mut String, report: &DiscoverReport) {
     if let Some(at) = &report.all_tools {
         out.push('\n');
         out.push_str(&crate::discover::tools::format_all_tools_text(at));
     }
-
-    out
 }
 
 fn append_agent_notes(out: &mut String, status: AgentIntegrationStatus) {
@@ -302,6 +311,21 @@ mod tests {
     fn test_format_json_omits_all_tools_when_none() {
         let report = make_report(10, 2);
         assert!(!format_json(&report).contains("all_tools"));
+    }
+
+    // Controller-mandated regression: format_text's early return (no missed
+    // Bash savings) must still render the ALL TOOLS section when --all-tools
+    // was requested, even for a session with zero Bash commands.
+    #[test]
+    fn test_format_text_renders_all_tools_on_empty_supported_and_unsupported() {
+        let mut report = make_report(0, 0);
+        report.all_tools = Some(crate::discover::tools::AllToolsAnalyzer::new().finish(10));
+        let output = format_text(&report, 10, false);
+        assert!(
+            output.contains("ALL TOOLS"),
+            "Expected ALL TOOLS section even with no missed Bash savings, got:\n{}",
+            output
+        );
     }
 
     // B6 regression: integer division truncated small percentages to 0%.

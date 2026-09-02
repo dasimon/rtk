@@ -617,6 +617,9 @@ enum Commands {
         /// Output format: text, json
         #[arg(short, long, default_value = "text")]
         format: String,
+        /// Attribute token usage across ALL tools (Read, MCP, native), not just Bash
+        #[arg(long)]
+        all_tools: bool,
     },
 
     /// Show RTK adoption across Claude Code sessions
@@ -2314,8 +2317,17 @@ fn run_cli() -> Result<i32> {
             all,
             since,
             format,
+            all_tools,
         } => {
-            discover::run(project.as_deref(), all, since, limit, &format, cli.verbose)?;
+            discover::run(
+                project.as_deref(),
+                all,
+                since,
+                limit,
+                &format,
+                cli.verbose,
+                all_tools,
+            )?;
             0
         }
 

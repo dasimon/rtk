@@ -2,7 +2,7 @@
 //! from Claude Code session JSONL (the Bash-only provider misses ~65% of bytes).
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -39,7 +39,10 @@ pub fn normalize_path(p: &str) -> String {
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
 /// Extrait tous les événements outils d'une session, dans l'ordre du fichier.
-/// Retourne (événements, nb de tool_result orphelins). Ligne invalide = ignorée.
+/// Retourne (événements, nb de tool_result réellement orphelins — un tool_result
+/// dont le tool_use est un Edit/Write/NotebookEdit est consommé silencieusement,
+/// pas compté, puisque son événement a déjà été émis au tool_use). Ligne invalide
+/// = ignorée.
 #[allow(dead_code)] // wired by Task 2/3 (attribution & report)
 pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
     let file =
@@ -48,6 +51,10 @@ pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
 
     // id -> (tool name, command Bash éventuelle, file_path Read éventuel)
     let mut pending: HashMap<String, (String, Option<String>, Option<String>)> = HashMap::new();
+    // ids des tool_use Edit/Write/NotebookEdit : leur tool_result est attendu
+    // (déjà compté via l'événement FileEdit) et doit être consommé sans
+    // incrémenter unmatched.
+    let mut edit_ids: HashSet<String> = HashSet::new();
     let mut events = Vec::new();
     let mut unmatched = 0usize;
     let mut seq = 0usize;
@@ -76,9 +83,13 @@ pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
                     };
                     let input_path = block
                         .pointer("/input/file_path")
+                        .or_else(|| block.pointer("/input/notebook_path"))
                         .and_then(|p| p.as_str())
                         .map(normalize_path);
                     if EDIT_TOOLS.contains(&name) {
+                        if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
+                            edit_ids.insert(id.to_string());
+                        }
                         if let Some(p) = input_path {
                             events.push(ToolEvent {
                                 kind: ToolEventKind::FileEdit { file_path: p },
@@ -101,6 +112,11 @@ pub fn extract_tool_events(path: &Path) -> Result<(Vec<ToolEvent>, usize)> {
                     let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
                         continue;
                     };
+                    if edit_ids.remove(id) {
+                        // Résultat d'un Edit/Write/NotebookEdit : déjà compté au
+                        // tool_use, consommé sans incrémenter unmatched.
+                        continue;
+                    }
                     let Some((tool, command, file_path)) = pending.remove(id) else {
                         unmatched += 1;
                         continue;
@@ -189,6 +205,33 @@ mod tests {
         let f = make_jsonl(&[edit_l, orphan, "not json at all"]);
         let (events, unmatched) = extract_tool_events(f.path()).unwrap();
         assert_eq!(unmatched, 1);
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            ToolEventKind::FileEdit { file_path } => assert_eq!(file_path, "c:/proj/a.rs"),
+            _ => panic!("expected FileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_extract_notebookedit_uses_notebook_path() {
+        let nb_l = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"n1","name":"NotebookEdit","input":{"notebook_path":"C:\\proj\\nb.ipynb","new_source":"x"}}]}}"#;
+        let f = make_jsonl(&[nb_l]);
+        let (events, unmatched) = extract_tool_events(f.path()).unwrap();
+        assert_eq!(unmatched, 0);
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            ToolEventKind::FileEdit { file_path } => assert_eq!(file_path, "c:/proj/nb.ipynb"),
+            _ => panic!("expected FileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_extract_edit_result_consumed_not_unmatched() {
+        let edit_l = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"C:\\Proj\\A.rs","old_string":"x","new_string":"y"}}]}}"#;
+        let edit_res = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"e1","content":"ignored"}]}}"#;
+        let f = make_jsonl(&[edit_l, edit_res]);
+        let (events, unmatched) = extract_tool_events(f.path()).unwrap();
+        assert_eq!(unmatched, 0);
         assert_eq!(events.len(), 1);
         match &events[0].kind {
             ToolEventKind::FileEdit { file_path } => assert_eq!(file_path, "c:/proj/a.rs"),

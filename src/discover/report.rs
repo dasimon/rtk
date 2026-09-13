@@ -105,7 +105,7 @@ pub struct DiscoverReport {
     pub rtk_disabled_count: usize,
     pub rtk_disabled_examples: Vec<String>,
     pub agent_status: AgentIntegrationStatus,
-    /// Attribution tous-outils (`--all-tools` uniquement). Absent du JSON sinon.
+    /// All-tools attribution (`--all-tools` only). Omitted from the JSON otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub all_tools: Option<crate::discover::tools::AllToolsReport>,
 }
